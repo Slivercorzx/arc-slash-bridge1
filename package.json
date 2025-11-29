@@ -1,0 +1,9 @@
+
+{
+  "name": "arc-slash-bridge",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "tweetnacl": "^1.0.3"
+  }
+}
