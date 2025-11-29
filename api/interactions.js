@@ -1,17 +1,13 @@
-// /api/interactions.js  (เวอร์ชันดีบั๊ก + Fallback)
-// - ยืนยันลายเซ็น Discord
-// - ตอบ defer (กำลังคิด…)
-// - พยายามส่งต่อไป GAS
-// - ถ้า GAS พัง/ตอบไม่ 2xx จะ PATCH ข้อความเดิมให้ขึ้น error ทันที
-
+// api/interactions.js
 import nacl from 'tweetnacl';
 export const config = { api: { bodyParser: false } };
 
+// ----- utils -----
 function readRawBody(req) {
   return new Promise((resolve, reject) => {
     let data = '';
     req.setEncoding('utf8');
-    req.on('data', (ch) => (data += ch));
+    req.on('data', (c) => (data += c));
     req.on('end', () => resolve(data));
     req.on('error', reject);
   });
@@ -21,55 +17,73 @@ function json(res, status, body) {
   res.setHeader('Content-Type', 'application/json');
   res.end(JSON.stringify(body));
 }
+async function postToGAS(url, payload) {
+  // ยิงครั้งแรกแบบไม่ตาม redirect
+  let r = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'User-Agent': 'arc-vercel-bridge/1.1' },
+    body: JSON.stringify(payload),
+    redirect: 'manual',          // สำคัญ: กัน POST ถูกเปลี่ยนเป็น GET
+    signal: AbortSignal.timeout(15000)
+  });
 
+  // ถ้าโดน 30x ให้ re-POST ไป Location เอง
+  if ([301, 302, 303, 307, 308].includes(r.status)) {
+    const loc = r.headers.get('location');
+    if (loc) {
+      r = await fetch(loc, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'User-Agent': 'arc-vercel-bridge/1.1' },
+        body: JSON.stringify(payload),
+        signal: AbortSignal.timeout(15000)
+      });
+    }
+  }
+  return r;
+}
+
+// ----- handler -----
 export default async function handler(req, res) {
   if (req.method !== 'POST') return json(res, 405, { error: 'Method not allowed' });
 
-  const signature = req.headers['x-signature-ed25519'];
-  const timestamp = req.headers['x-signature-timestamp'];
-  const publicKey = process.env.DISCORD_PUBLIC_KEY;
-  if (!signature || !timestamp || !publicKey) return json(res, 400, { error: 'missing header/key' });
+  const sig = req.headers['x-signature-ed25519'];
+  const ts  = req.headers['x-signature-timestamp'];
+  const pk  = process.env.DISCORD_PUBLIC_KEY;
+  if (!sig || !ts || !pk) return json(res, 400, { error: 'missing signature/public key' });
 
   const raw = await readRawBody(req);
   const ok = nacl.sign.detached.verify(
-    Buffer.from(timestamp + raw),
-    Buffer.from(signature, 'hex'),
-    Buffer.from(publicKey, 'hex')
+    Buffer.from(ts + raw),
+    Buffer.from(sig, 'hex'),
+    Buffer.from(pk, 'hex')
   );
   if (!ok) return json(res, 401, { error: 'invalid request signature' });
 
-  let payload;
-  try { payload = JSON.parse(raw); } catch { return json(res, 400, { error: 'bad json' }); }
+  let body;
+  try { body = JSON.parse(raw); } catch { return json(res, 400, { error: 'bad json' }); }
 
   // PING
-  if (payload.type === 1) return json(res, 200, { type: 1 });
+  if (body.type === 1) return json(res, 200, { type: 1 });
 
-  // Slash command
-  if (payload.type === 2) {
-    // ตอบ defer (ephemeral)
+  // SLASH COMMAND
+  if (body.type === 2) {
+    // 1) ตอบ defer (ephemeral)
     json(res, 200, { type: 5, data: { flags: 64, content: '⏳ กำลังประมวลผล…' } });
 
-    const forwardBody = {
+    const forward = {
       kind: 'forward',
-      application_id: payload.application_id,
-      token: payload.token,
-      guild_id: payload.guild_id,
-      channel_id: payload.channel_id,
-      user_id: payload.member?.user?.id || payload.user?.id || null,
-      command: payload.data?.name || '',
-      options: payload.data?.options || []
+      application_id: body.application_id,
+      token: body.token,
+      guild_id: body.guild_id,
+      channel_id: body.channel_id,
+      user_id: body.member?.user?.id || body.user?.id || null,
+      command: body.data?.name || '',
+      options: body.data?.options || []
     };
-
-    // เตรียม URL ที่จะ PATCH ถ้า GAS ล้มเหลว
-    const originalUrl = `https://discord.com/api/v10/webhooks/${payload.application_id}/${payload.token}/messages/@original`;
+    const originalUrl = `https://discord.com/api/v10/webhooks/${body.application_id}/${body.token}/messages/@original`;
 
     try {
-      const r = await fetch(process.env.GAS_FORWARD_URL, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(forwardBody)
-      });
-
+      const r = await postToGAS(process.env.GAS_FORWARD_URL, forward);
       if (!r.ok) {
         const txt = await r.text().catch(() => '');
         console.error('Forward status', r.status, txt);
